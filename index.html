@@ -34,9 +34,17 @@
 
   <script src="https://docs.opencv.org/4.x/opencv.js"></script>
   <script>
-  // ---- Your HSV thresholds ----
-  let LOWER = [ 5, 120, 200 ];   // H,S,V
-  let UPPER = [ 25, 255, 255 ];
+  // ---- HSV thresholds (load from localStorage if present) ----
+  function loadHSV() {
+    try {
+      const L = JSON.parse(localStorage.getItem('pong_lower'));
+      const U = JSON.parse(localStorage.getItem('pong_upper'));
+      if (Array.isArray(L) && L.length===3 && Array.isArray(U) && U.length===3) return [L,U];
+    } catch {}
+    // default (orange-ish); you'll long-press to retune for blue/other colors
+    return [[5,120,200],[25,255,255]];
+  }
+  let [LOWER, UPPER] = loadHSV();
 
   const MIN_AREA = 120;
   const TRAIL_LEN = 20;
@@ -53,7 +61,11 @@
   const hsvTag  = document.getElementById('hsvTag');
   const statusEl= document.getElementById('status');
 
-  hsvTag.textContent = `H[${LOWER[0]}-${UPPER[0]}] S[${LOWER[1]}-${UPPER[1]}] V[${LOWER[2]}-${UPPER[2]}]`;
+  function refreshHSVTag(){
+    hsvTag.textContent = `H[${LOWER[0]}-${UPPER[0]}] S[${LOWER[1]}-${UPPER[1]}] V[${LOWER[2]}-${UPPER[2]}]`;
+  }
+  function setStatus(msg){ statusEl.textContent=msg||""; statusEl.style.display=msg?"inline-block":"none"; }
+  refreshHSVTag();
 
   // ---- State ----
   let showMask = false;
@@ -71,18 +83,38 @@
   const grab = document.createElement('canvas');
   const gtx  = grab.getContext('2d', { willReadFrequently: true });
 
-  function setStatus(msg){ statusEl.textContent=msg||""; statusEl.style.display=msg?"inline-block":"none"; }
+  // Pending color pick (set by long-press)
+  let pendingPick = null;
 
-  // Tap to set line (works on iOS)
-  function setLineFromEvent(e){
+  // Helpers
+  const clamp = (v, lo, hi)=>Math.max(lo, Math.min(hi, v));
+  const median = arr => { const a=[...arr].sort((x,y)=>x-y); const m=Math.floor(a.length/2); return a.length%2?a[m]:(a[m-1]+a[m])/2; };
+
+  // Tap / long-press handling
+  let pressTimer = null, pressXY = null;
+  function onPointerDown(e){
     const rect = overlay.getBoundingClientRect();
-    const clientY = (e.clientY ?? (e.touches && e.touches[0].clientY));
-    if (clientY == null) return;
-    const y = clientY - rect.top;
-    lineY = Math.round(y * (overlay.height / rect.height));
+    const cx = (e.clientX ?? (e.touches && e.touches[0].clientX)) - rect.left;
+    const cy = (e.clientY ?? (e.touches && e.touches[0].clientY)) - rect.top;
+    // Convert to canvas coordinates
+    const x = Math.round(cx * (overlay.width / rect.width));
+    const y = Math.round(cy * (overlay.height / rect.height));
+    pressXY = {x,y};
+    pressTimer = setTimeout(()=>{ pendingPick = pressXY; setStatus("Picked color… updating HSV"); }, 450); // long-press
   }
-  overlay.addEventListener('pointerdown', setLineFromEvent);
-  overlay.addEventListener('touchstart', setLineFromEvent, {passive:true});
+  function onPointerUp(){
+    if (pressTimer){
+      clearTimeout(pressTimer);
+      pressTimer = null;
+      if (!pendingPick && pressXY){ // it was a tap → set/move line
+        lineY = pressXY.y;
+      }
+    }
+  }
+  overlay.addEventListener('pointerdown', onPointerDown);
+  overlay.addEventListener('pointerup', onPointerUp);
+  overlay.addEventListener('touchstart', onPointerDown, {passive:true});
+  overlay.addEventListener('touchend', onPointerUp, {passive:true});
 
   // Camera start
   startBtn.onclick = async () => {
@@ -90,7 +122,7 @@
     try {
       const s = await navigator.mediaDevices.getUserMedia({ video: { facingMode:'environment' }, audio:false });
       video.srcObject = s;
-      setStatus('Camera started — waiting for OpenCV…');
+      setStatus('Camera started — waiting for OpenCV… (long-press the ball to auto-tune)');
     } catch (e) {
       setStatus('Camera error: ' + e);
       startBtn.disabled = false;
@@ -104,16 +136,13 @@
     if (!vw || !vh) return false;
     if (vw === W && vh === H && src) return true;
 
-    // delete old mats
     [src, frame, hsv, mask, blur, opened, kernel].forEach(m => { try { m && m.delete(); } catch {} });
 
-    // set new sizes
     W = vw; H = vh;
     canvas.width = overlay.width = W;
     canvas.height = overlay.height = H;
     grab.width = W; grab.height = H;
 
-    // (re)create mats
     src    = new cv.Mat(H, W, cv.CV_8UC4);
     frame  = new cv.Mat(H, W, cv.CV_8UC3);
     hsv    = new cv.Mat();
@@ -133,7 +162,7 @@
   function maybeStart(){
     if (!opencvReady || !streamReady) return;
     if (!ensureSize()) return;
-    setStatus('Running… tap to set the line.');
+    setStatus('Running… tap = set line, long-press = pick color');
     loop();
   }
 
@@ -141,42 +170,61 @@
     const circle = cv.minEnclosingCircle(c);
     const x = circle.center.x, y = circle.center.y, r = circle.radius;
     if (r < 6 || r > 90) return [false, x, y, r];
-
-    const area = cv.contourArea(c, false);
-    if (area <= 1) return [false, x, y, r];
-    const peri = cv.arcLength(c, true);
-    if (peri <= 1) return [false, x, y, r];
+    const area = cv.contourArea(c, false); if (area <= 1) return [false, x, y, r];
+    const peri = cv.arcLength(c, true);    if (peri <= 1) return [false, x, y, r];
 
     const circularity = 4.0 * Math.PI * (area / (peri * peri));
     if (circularity < 0.70) return [false, x, y, r];
 
-    const hull = new cv.Mat();
-    cv.convexHull(c, hull, false, true);
-    const hullArea = cv.contourArea(hull, false);
-    hull.delete();
+    const hull = new cv.Mat(); cv.convexHull(c, hull, false, true);
+    const hullArea = cv.contourArea(hull, false); hull.delete();
     if (hullArea <= 0) return [false, x, y, r];
     const solidity = area / hullArea;
     if (solidity < 0.85) return [false, x, y, r];
-
     return [true, x, y, r];
   }
 
   function loop() {
     function tick() {
       try {
-        // Re-size if Safari changed stream resolution
         if (!ensureSize()) { requestAnimationFrame(tick); return; }
 
-        // ---- Grab the current video frame via offscreen canvas
+        // Grab current frame
         gtx.drawImage(video, 0, 0, W, H);
         const imgData = gtx.getImageData(0, 0, W, H);
-        src.data.set(imgData.data);  // RGBA → CV_8UC4
+        src.data.set(imgData.data);  // RGBA
 
-        // ---- Process
+        // Process
         cv.cvtColor(src, frame, cv.COLOR_RGBA2BGR);
         cv.cvtColor(frame, hsv, cv.COLOR_BGR2HSV);
 
-        // NOTE: OpenCV.js wants Mats for lower/upper — not Scalars
+        // If user long-pressed, sample a small patch and set HSV
+        if (pendingPick){
+          const {x, y} = pendingPick;
+          const r = 6; // sample radius
+          const Hs=[], Ss=[], Vs=[];
+          for (let dy=-r; dy<=r; dy++){
+            const yy = clamp(y+dy, 0, H-1);
+            for (let dx=-r; dx<=r; dx++){
+              const xx = clamp(x+dx, 0, W-1);
+              const idx = (yy*W + xx)*3;
+              Hs.push(hsv.data[idx]);
+              Ss.push(hsv.data[idx+1]);
+              Vs.push(hsv.data[idx+2]);
+            }
+          }
+          const h0 = median(Hs), s0 = median(Ss), v0 = median(Vs);
+          const huePad = 12, svPad = 60;
+          LOWER = [ clamp(h0 - huePad, 0, 179), clamp(s0 - svPad, 0, 255), clamp(v0 - svPad, 0, 255) ];
+          UPPER = [ clamp(h0 + huePad, 0, 179), 255, 255 ];
+          localStorage.setItem('pong_lower', JSON.stringify(LOWER));
+          localStorage.setItem('pong_upper', JSON.stringify(UPPER));
+          refreshHSVTag();
+          setStatus(`HSV updated → H[${LOWER[0]}-${UPPER[0]}] S[${LOWER[1]}-255] V[${LOWER[2]}-255]`);
+          pendingPick = null;
+        }
+
+        // Threshold & cleanup
         const lower = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), [LOWER[0], LOWER[1], LOWER[2], 0]);
         const upper = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), [UPPER[0], UPPER[1], UPPER[2], 255]);
         cv.inRange(hsv, lower, upper, mask);
@@ -210,7 +258,7 @@
         if (validDetectStreak < 2) ballCenter = null;
 
         // Draw frame or mask
-        cv.imshow(canvas, showMask ? opened : frame);
+        cv.imshow('canvas', showMask ? opened : frame);
 
         // Overlay
         ctxUI.clearRect(0,0,overlay.width,overlay.height);
