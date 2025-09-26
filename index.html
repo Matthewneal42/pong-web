@@ -67,7 +67,7 @@
   let W=0, H=0;
   let src=null, frame=null, hsv=null, mask=null, blur=null, opened=null, kernel=null;
 
-  // Offscreen canvas we draw the <video> into each frame (replaces cv.VideoCapture)
+  // Offscreen canvas to grab <video> frames (avoids cv.VideoCapture issues on iOS)
   const grab = document.createElement('canvas');
   const gtx  = grab.getContext('2d', { willReadFrequently: true });
 
@@ -162,9 +162,6 @@
   }
 
   function loop() {
-    const lower = new cv.Scalar(LOWER[0], LOWER[1], LOWER[2], 0);
-    const upper = new cv.Scalar(UPPER[0], UPPER[1], UPPER[2], 255);
-
     function tick() {
       try {
         // Re-size if Safari changed stream resolution
@@ -179,7 +176,12 @@
         cv.cvtColor(src, frame, cv.COLOR_RGBA2BGR);
         cv.cvtColor(frame, hsv, cv.COLOR_BGR2HSV);
 
+        // NOTE: OpenCV.js wants Mats for lower/upper — not Scalars
+        const lower = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), [LOWER[0], LOWER[1], LOWER[2], 0]);
+        const upper = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), [UPPER[0], UPPER[1], UPPER[2], 255]);
         cv.inRange(hsv, lower, upper, mask);
+        lower.delete(); upper.delete();
+
         cv.GaussianBlur(mask, blur, new cv.Size(9,9), 0);
         cv.morphologyEx(blur, opened, cv.MORPH_OPEN, kernel);
 
@@ -208,7 +210,7 @@
         if (validDetectStreak < 2) ballCenter = null;
 
         // Draw frame or mask
-        cv.imshow('canvas', showMask ? opened : frame);
+        cv.imshow(canvas, showMask ? opened : frame);
 
         // Overlay
         ctxUI.clearRect(0,0,overlay.width,overlay.height);
