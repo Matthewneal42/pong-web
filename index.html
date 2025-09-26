@@ -32,6 +32,7 @@
     <span class="tag" id="hsvTag"></span>
   </div>
 
+  <!-- OpenCV.js -->
   <script src="https://docs.opencv.org/4.x/opencv.js"></script>
   <script>
   // ---- Your HSV thresholds ----
@@ -116,7 +117,7 @@
     opened = new cv.Mat();
     kernel = cv.Mat.ones(5, 5, cv.CV_8U);
 
-    // (re)create capture wrapper (safe)
+    // (re)create capture wrapper
     cap = new cv.VideoCapture(video);
     return true;
   }
