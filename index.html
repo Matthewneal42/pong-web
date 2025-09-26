@@ -7,7 +7,7 @@
   <style>
     html,body { margin:0; background:#111; color:#eee; font-family:system-ui,sans-serif; height:100%; }
     #wrap { position:relative; width:100vw; height:100vh; overflow:hidden; }
-    /* Layers: hidden video < canvas (image) < overlay (lines) < UI/status */
+    /* Layers: hidden video < canvas (image) < overlay (UI) < buttons */
     #video   { position:absolute; inset:0; width:100%; height:100%; object-fit:contain; opacity:0; }
     #canvas  { position:absolute; inset:0; width:100%; height:100%; }
     #overlay { position:absolute; inset:0; width:100%; height:100%; pointer-events:auto; }
@@ -32,7 +32,6 @@
     <span class="tag" id="hsvTag"></span>
   </div>
 
-  <!-- OpenCV.js -->
   <script src="https://docs.opencv.org/4.x/opencv.js"></script>
   <script>
   // ---- Your HSV thresholds ----
@@ -64,9 +63,13 @@
   const trail = Array(TRAIL_LEN).fill(null);
   let validDetectStreak = 0;
 
-  // OpenCV mats (re-alloc on size change)
-  let W = 0, H = 0, cap = null;
+  // Mats (realloc on size change)
+  let W=0, H=0;
   let src=null, frame=null, hsv=null, mask=null, blur=null, opened=null, kernel=null;
+
+  // Offscreen canvas we draw the <video> into each frame (replaces cv.VideoCapture)
+  const grab = document.createElement('canvas');
+  const gtx  = grab.getContext('2d', { willReadFrequently: true });
 
   function setStatus(msg){ statusEl.textContent=msg||""; statusEl.style.display=msg?"inline-block":"none"; }
 
@@ -81,6 +84,7 @@
   overlay.addEventListener('pointerdown', setLineFromEvent);
   overlay.addEventListener('touchstart', setLineFromEvent, {passive:true});
 
+  // Camera start
   startBtn.onclick = async () => {
     startBtn.disabled = true;
     try {
@@ -94,8 +98,8 @@
   };
   maskBtn.onclick = () => { showMask = !showMask; };
 
-  // Allocate mats if video size changes (fixes "bad size of input mat")
-  function ensureMatsForCurrentVideoSize() {
+  // Ensure mats & canvases match the current video size
+  function ensureSize() {
     const vw = video.videoWidth, vh = video.videoHeight;
     if (!vw || !vh) return false;
     if (vw === W && vh === H && src) return true;
@@ -107,6 +111,7 @@
     W = vw; H = vh;
     canvas.width = overlay.width = W;
     canvas.height = overlay.height = H;
+    grab.width = W; grab.height = H;
 
     // (re)create mats
     src    = new cv.Mat(H, W, cv.CV_8UC4);
@@ -116,9 +121,6 @@
     blur   = new cv.Mat();
     opened = new cv.Mat();
     kernel = cv.Mat.ones(5, 5, cv.CV_8U);
-
-    // (re)create capture wrapper
-    cap = new cv.VideoCapture(video);
     return true;
   }
 
@@ -126,11 +128,11 @@
   let opencvReady = false, streamReady = false;
   cv.onRuntimeInitialized = () => { opencvReady = true; setStatus('OpenCV ready — start the camera.'); maybeStart(); };
   video.addEventListener('loadedmetadata', () => { streamReady = true; maybeStart(); });
-  window.addEventListener('orientationchange', () => { setTimeout(ensureMatsForCurrentVideoSize, 300); });
+  window.addEventListener('orientationchange', () => { setTimeout(ensureSize, 300); });
 
   function maybeStart(){
     if (!opencvReady || !streamReady) return;
-    if (!ensureMatsForCurrentVideoSize()) return;
+    if (!ensureSize()) return;
     setStatus('Running… tap to set the line.');
     loop();
   }
@@ -165,10 +167,15 @@
 
     function tick() {
       try {
-        // Handle size changes live (iOS can switch resolution)
-        if (!ensureMatsForCurrentVideoSize()) { requestAnimationFrame(tick); return; }
+        // Re-size if Safari changed stream resolution
+        if (!ensureSize()) { requestAnimationFrame(tick); return; }
 
-        cap.read(src);
+        // ---- Grab the current video frame via offscreen canvas
+        gtx.drawImage(video, 0, 0, W, H);
+        const imgData = gtx.getImageData(0, 0, W, H);
+        src.data.set(imgData.data);  // RGBA → CV_8UC4
+
+        // ---- Process
         cv.cvtColor(src, frame, cv.COLOR_RGBA2BGR);
         cv.cvtColor(frame, hsv, cv.COLOR_BGR2HSV);
 
@@ -200,7 +207,7 @@
         else            validDetectStreak = 0;
         if (validDetectStreak < 2) ballCenter = null;
 
-        // Draw frame/mask
+        // Draw frame or mask
         cv.imshow('canvas', showMask ? opened : frame);
 
         // Overlay
