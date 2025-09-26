@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <title>Pong Height Check (Web)</title>
+  <style>
+    html,body { margin:0; background:#111; color:#eee; font-family:system-ui,sans-serif; height:100%; }
+    #wrap { position:relative; width:100vw; height:100vh; overflow:hidden; }
+    /* Layers: hidden video < canvas (image) < overlay (lines) < UI/status */
+    #video   { position:absolute; inset:0; width:100%; height:100%; object-fit:contain; opacity:0; }
+    #canvas  { position:absolute; inset:0; width:100%; height:100%; }
+    #overlay { position:absolute; inset:0; width:100%; height:100%; pointer-events:auto; }
+    #ui { position:fixed; left:8px; bottom:8px; z-index:5; background:#0008; padding:8px 10px; border-radius:8px; font-size:14px; }
+    .btn { background:#2e7; border:0; padding:6px 10px; border-radius:6px; color:#000; cursor:pointer; margin-right:6px; }
+    .tag { opacity:.85; margin-left:6px; }
+    #status { position:fixed; left:8px; top:8px; z-index:6; background:#f66; color:#000; font-weight:600; padding:6px 10px; border-radius:8px; display:none; }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <video id="video" playsinline autoplay muted></video>
+    <canvas id="canvas"></canvas>
+    <canvas id="overlay"></canvas>
+  </div>
+
+  <div id="status"></div>
+
+  <div id="ui">
+    <button id="start" class="btn">Start camera</button>
+    <button id="maskBtn" class="btn">Toggle mask</button>
+    <span class="tag" id="hsvTag"></span>
+  </div>
+
+  <script src="https://docs.opencv.org/4.x/opencv.js"></script>
+  <script>
+  // ---- Your HSV thresholds ----
+  let LOWER = [ 5, 120, 200 ];   // H,S,V
+  let UPPER = [ 25, 255, 255 ];
+
+  const MIN_AREA = 120;
+  const TRAIL_LEN = 20;
+  const NEEDED_FRAMES_ABOVE = 3;
+  let COOLDOWN_FRAMES = 7;
+
+  // ---- DOM ----
+  const video   = document.getElementById('video');
+  const canvas  = document.getElementById('canvas');
+  const overlay = document.getElementById('overlay');
+  const ctxUI   = overlay.getContext('2d');
+  const startBtn= document.getElementById('start');
+  const maskBtn = document.getElementById('maskBtn');
+  const hsvTag  = document.getElementById('hsvTag');
+  const statusEl= document.getElementById('status');
+
+  hsvTag.textContent = `H[${LOWER[0]}-${UPPER[0]}] S[${LOWER[1]}-${UPPER[1]}] V[${LOWER[2]}-${UPPER[2]}]`;
+
+  // ---- State ----
+  let showMask = false;
+  let lineY = null;
+  let aboveStreak = 0;
+  let legalCooldown = 0;
+  const trail = Array(TRAIL_LEN).fill(null);
+  let validDetectStreak = 0;
+
+  // OpenCV mats (re-alloc on size change)
+  let W = 0, H = 0, cap = null;
+  let src=null, frame=null, hsv=null, mask=null, blur=null, opened=null, kernel=null;
+
+  function setStatus(msg){ statusEl.textContent=msg||""; statusEl.style.display=msg?"inline-block":"none"; }
+
+  // Tap to set line (works on iOS)
+  function setLineFromEvent(e){
+    const rect = overlay.getBoundingClientRect();
+    const clientY = (e.clientY ?? (e.touches && e.touches[0].clientY));
+    if (clientY == null) return;
+    const y = clientY - rect.top;
+    lineY = Math.round(y * (overlay.height / rect.height));
+  }
+  overlay.addEventListener('pointerdown', setLineFromEvent);
+  overlay.addEventListener('touchstart', setLineFromEvent, {passive:true});
+
+  startBtn.onclick = async () => {
+    startBtn.disabled = true;
+    try {
+      const s = await navigator.mediaDevices.getUserMedia({ video: { facingMode:'environment' }, audio:false });
+      video.srcObject = s;
+      setStatus('Camera started — waiting for OpenCV…');
+    } catch (e) {
+      setStatus('Camera error: ' + e);
+      startBtn.disabled = false;
+    }
+  };
+  maskBtn.onclick = () => { showMask = !showMask; };
+
+  // Allocate mats if video size changes (fixes "bad size of input mat")
+  function ensureMatsForCurrentVideoSize() {
+    const vw = video.videoWidth, vh = video.videoHeight;
+    if (!vw || !vh) return false;
+    if (vw === W && vh === H && src) return true;
+
+    // delete old mats
+    [src, frame, hsv, mask, blur, opened, kernel].forEach(m => { try { m && m.delete(); } catch {} });
+
+    // set new sizes
+    W = vw; H = vh;
+    canvas.width = overlay.width = W;
+    canvas.height = overlay.height = H;
+
+    // (re)create mats
+    src    = new cv.Mat(H, W, cv.CV_8UC4);
+    frame  = new cv.Mat(H, W, cv.CV_8UC3);
+    hsv    = new cv.Mat();
+    mask   = new cv.Mat();
+    blur   = new cv.Mat();
+    opened = new cv.Mat();
+    kernel = cv.Mat.ones(5, 5, cv.CV_8U);
+
+    // (re)create capture wrapper (safe)
+    cap = new cv.VideoCapture(video);
+    return true;
+  }
+
+  // Wait for both camera and OpenCV to be ready
+  let opencvReady = false, streamReady = false;
+  cv.onRuntimeInitialized = () => { opencvReady = true; setStatus('OpenCV ready — start the camera.'); maybeStart(); };
+  video.addEventListener('loadedmetadata', () => { streamReady = true; maybeStart(); });
+  window.addEventListener('orientationchange', () => { setTimeout(ensureMatsForCurrentVideoSize, 300); });
+
+  function maybeStart(){
+    if (!opencvReady || !streamReady) return;
+    if (!ensureMatsForCurrentVideoSize()) return;
+    setStatus('Running… tap to set the line.');
+    loop();
+  }
+
+  function isValidBallContour(c) {
+    const circle = cv.minEnclosingCircle(c);
+    const x = circle.center.x, y = circle.center.y, r = circle.radius;
+    if (r < 6 || r > 90) return [false, x, y, r];
+
+    const area = cv.contourArea(c, false);
+    if (area <= 1) return [false, x, y, r];
+    const peri = cv.arcLength(c, true);
+    if (peri <= 1) return [false, x, y, r];
+
+    const circularity = 4.0 * Math.PI * (area / (peri * peri));
+    if (circularity < 0.70) return [false, x, y, r];
+
+    const hull = new cv.Mat();
+    cv.convexHull(c, hull, false, true);
+    const hullArea = cv.contourArea(hull, false);
+    hull.delete();
+    if (hullArea <= 0) return [false, x, y, r];
+    const solidity = area / hullArea;
+    if (solidity < 0.85) return [false, x, y, r];
+
+    return [true, x, y, r];
+  }
+
+  function loop() {
+    const lower = new cv.Scalar(LOWER[0], LOWER[1], LOWER[2], 0);
+    const upper = new cv.Scalar(UPPER[0], UPPER[1], UPPER[2], 255);
+
+    function tick() {
+      try {
+        // Handle size changes live (iOS can switch resolution)
+        if (!ensureMatsForCurrentVideoSize()) { requestAnimationFrame(tick); return; }
+
+        cap.read(src);
+        cv.cvtColor(src, frame, cv.COLOR_RGBA2BGR);
+        cv.cvtColor(frame, hsv, cv.COLOR_BGR2HSV);
+
+        cv.inRange(hsv, lower, upper, mask);
+        cv.GaussianBlur(mask, blur, new cv.Size(9,9), 0);
+        cv.morphologyEx(blur, opened, cv.MORPH_OPEN, kernel);
+
+        // Find contours
+        const contours = new cv.MatVector();
+        const hierarchy = new cv.Mat();
+        cv.findContours(opened, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+        let ballCenter = null;
+        const idxs = [...Array(contours.size()).keys()];
+        idxs.sort((a,b)=>cv.contourArea(contours.get(b)) - cv.contourArea(contours.get(a)));
+        for (let i=0; i<Math.min(5, idxs.length); i++) {
+          const c = contours.get(idxs[i]);
+          if (cv.contourArea(c) < MIN_AREA) { c.delete(); continue; }
+          const [ok, x, y, r] = isValidBallContour(c);
+          if (!ok) { c.delete(); continue; }
+          const M = cv.moments(c, false);
+          if (M.m00 !== 0) ballCenter = { x: Math.round(M.m10/M.m00), y: Math.round(M.m01/M.m00) };
+          c.delete(); break;
+        }
+        contours.delete(); hierarchy.delete();
+
+        // Debounce (require 2 consecutive frames)
+        if (ballCenter) validDetectStreak = Math.min(validDetectStreak+1, 2);
+        else            validDetectStreak = 0;
+        if (validDetectStreak < 2) ballCenter = null;
+
+        // Draw frame/mask
+        cv.imshow('canvas', showMask ? opened : frame);
+
+        // Overlay
+        ctxUI.clearRect(0,0,overlay.width,overlay.height);
+        if (lineY !== null) {
+          ctxUI.strokeStyle = 'yellow';
+          ctxUI.lineWidth = 3;
+          ctxUI.beginPath();
+          ctxUI.moveTo(0, lineY);
+          ctxUI.lineTo(overlay.width, lineY);
+          ctxUI.stroke();
+        }
+        // Trail
+        trail.push(ballCenter ? {x:ballCenter.x, y:ballCenter.y} : null);
+        if (trail.length > TRAIL_LEN) trail.shift();
+        ctxUI.strokeStyle = 'rgba(0,200,255,0.9)';
+        ctxUI.lineWidth = 2;
+        for (let i=1;i<trail.length;i++) {
+          const a = trail[i-1], b = trail[i];
+          if (a && b) { ctxUI.beginPath(); ctxUI.moveTo(a.x,a.y); ctxUI.lineTo(b.x,b.y); ctxUI.stroke(); }
+        }
+        // LEGAL
+        if (lineY !== null && ballCenter) {
+          if (ballCenter.y < lineY - 3) aboveStreak++; else aboveStreak = 0;
+          if (aboveStreak >= NEEDED_FRAMES_ABOVE) { legalCooldown = COOLDOWN_FRAMES; aboveStreak = 0; }
+        }
+        if (legalCooldown > 0) {
+          ctxUI.fillStyle = 'rgba(0,255,0,0.9)';
+          ctxUI.font = 'bold 28px system-ui, sans-serif';
+          ctxUI.fillText('LEGAL', 16, overlay.height - 16);
+          legalCooldown--;
+        }
+
+        requestAnimationFrame(tick);
+      } catch (e) {
+        setStatus('Runtime error: ' + e);
+      }
+    }
+    requestAnimationFrame(tick);
+  }
+  </script>
+</body>
+</html>
