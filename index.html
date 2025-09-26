@@ -11,8 +11,9 @@
     #video   { position:absolute; inset:0; width:100%; height:100%; object-fit:contain; opacity:0; }
     #canvas  { position:absolute; inset:0; width:100%; height:100%; }
     #overlay { position:absolute; inset:0; width:100%; height:100%; pointer-events:auto; }
-    #ui { position:fixed; left:8px; bottom:8px; z-index:5; background:#0008; padding:8px 10px; border-radius:8px; font-size:14px; }
-    .btn { background:#2e7; border:0; padding:6px 10px; border-radius:6px; color:#000; cursor:pointer; margin-right:6px; }
+    #ui { position:fixed; left:8px; bottom:8px; z-index:5; background:#0008; padding:8px 10px; border-radius:8px; font-size:14px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    .btn { background:#2e7; border:0; padding:6px 10px; border-radius:6px; color:#000; cursor:pointer; }
+    .btn.toggled { background:#7cf; color:#000; }
     .tag { opacity:.85; margin-left:6px; }
     #status { position:fixed; left:8px; top:8px; z-index:6; background:#f66; color:#000; font-weight:600; padding:6px 10px; border-radius:8px; display:none; }
   </style>
@@ -29,6 +30,8 @@
   <div id="ui">
     <button id="start" class="btn">Start camera</button>
     <button id="maskBtn" class="btn">Toggle mask</button>
+    <button id="pickBtn" class="btn">Pick color</button>
+    <button id="resetBtn" class="btn">Reset HSV</button>
     <span class="tag" id="hsvTag"></span>
   </div>
 
@@ -41,7 +44,7 @@
       const U = JSON.parse(localStorage.getItem('pong_upper'));
       if (Array.isArray(L) && L.length===3 && Array.isArray(U) && U.length===3) return [L,U];
     } catch {}
-    // default (orange-ish); you'll long-press to retune for blue/other colors
+    // default (orange-ish); you can pick a new color with the button
     return [[5,120,200],[25,255,255]];
   }
   let [LOWER, UPPER] = loadHSV();
@@ -58,17 +61,18 @@
   const ctxUI   = overlay.getContext('2d');
   const startBtn= document.getElementById('start');
   const maskBtn = document.getElementById('maskBtn');
+  const pickBtn = document.getElementById('pickBtn');
+  const resetBtn= document.getElementById('resetBtn');
   const hsvTag  = document.getElementById('hsvTag');
   const statusEl= document.getElementById('status');
 
-  function refreshHSVTag(){
-    hsvTag.textContent = `H[${LOWER[0]}-${UPPER[0]}] S[${LOWER[1]}-${UPPER[1]}] V[${LOWER[2]}-${UPPER[2]}]`;
-  }
-  function setStatus(msg){ statusEl.textContent=msg||""; statusEl.style.display=msg?"inline-block":"none"; }
+  const setStatus = (msg)=>{ statusEl.textContent=msg||""; statusEl.style.display=msg?"inline-block":"none"; };
+  const refreshHSVTag = ()=>{ hsvTag.textContent = `H[${LOWER[0]}-${UPPER[0]}] S[${LOWER[1]}-${UPPER[1]}] V[${LOWER[2]}-${UPPER[2]}]`; };
   refreshHSVTag();
 
   // ---- State ----
   let showMask = false;
+  let pickMode = false; // when true, next tap picks color
   let lineY = null;
   let aboveStreak = 0;
   let legalCooldown = 0;
@@ -83,52 +87,66 @@
   const grab = document.createElement('canvas');
   const gtx  = grab.getContext('2d', { willReadFrequently: true });
 
-  // Pending color pick (set by long-press)
-  let pendingPick = null;
-
   // Helpers
   const clamp = (v, lo, hi)=>Math.max(lo, Math.min(hi, v));
   const median = arr => { const a=[...arr].sort((x,y)=>x-y); const m=Math.floor(a.length/2); return a.length%2?a[m]:(a[m-1]+a[m])/2; };
 
-  // Tap / long-press handling
-  let pressTimer = null, pressXY = null;
-  function onPointerDown(e){
+  // Tap handling: if pickMode -> pick color at tap; else set line
+  function handleTap(e){
     const rect = overlay.getBoundingClientRect();
     const cx = (e.clientX ?? (e.touches && e.touches[0].clientX)) - rect.left;
     const cy = (e.clientY ?? (e.touches && e.touches[0].clientY)) - rect.top;
-    // Convert to canvas coordinates
     const x = Math.round(cx * (overlay.width / rect.width));
     const y = Math.round(cy * (overlay.height / rect.height));
-    pressXY = {x,y};
-    pressTimer = setTimeout(()=>{ pendingPick = pressXY; setStatus("Picked color… updating HSV"); }, 450); // long-press
-  }
-  function onPointerUp(){
-    if (pressTimer){
-      clearTimeout(pressTimer);
-      pressTimer = null;
-      if (!pendingPick && pressXY){ // it was a tap → set/move line
-        lineY = pressXY.y;
+    if (pickMode) {
+      // sample HSV around (x,y)
+      const r = 8;
+      const Hs=[], Ss=[], Vs=[];
+      for (let dy=-r; dy<=r; dy++){
+        const yy = clamp(y+dy, 0, H-1);
+        for (let dx=-r; dx<=r; dx++){
+          const xx = clamp(x+dx, 0, W-1);
+          const idx = (yy*W + xx)*3;
+          Hs.push(hsv.data[idx]);
+          Ss.push(hsv.data[idx+1]);
+          Vs.push(hsv.data[idx+2]);
+        }
       }
+      const h0 = median(Hs), s0 = median(Ss), v0 = median(Vs);
+      const huePad = 12, svPad = 60;
+      LOWER = [ clamp(h0 - huePad, 0, 179), clamp(s0 - svPad, 0, 255), clamp(v0 - svPad, 0, 255) ];
+      UPPER = [ clamp(h0 + huePad, 0, 179), 255, 255 ];
+      localStorage.setItem('pong_lower', JSON.stringify(LOWER));
+      localStorage.setItem('pong_upper', JSON.stringify(UPPER));
+      refreshHSVTag();
+      setStatus(`HSV updated → H[${LOWER[0]}-${UPPER[0]}] S[${LOWER[1]}-255] V[${LOWER[2]}-255]`);
+      pickMode = false; pickBtn.classList.remove('toggled');
+    } else {
+      lineY = y;
     }
   }
-  overlay.addEventListener('pointerdown', onPointerDown);
-  overlay.addEventListener('pointerup', onPointerUp);
-  overlay.addEventListener('touchstart', onPointerDown, {passive:true});
-  overlay.addEventListener('touchend', onPointerUp, {passive:true});
+  overlay.addEventListener('pointerdown', handleTap);
+  overlay.addEventListener('touchstart', handleTap, {passive:true});
 
-  // Camera start
+  // Buttons
   startBtn.onclick = async () => {
     startBtn.disabled = true;
     try {
       const s = await navigator.mediaDevices.getUserMedia({ video: { facingMode:'environment' }, audio:false });
       video.srcObject = s;
-      setStatus('Camera started — waiting for OpenCV… (long-press the ball to auto-tune)');
+      setStatus('Camera started — Pick color if needed, then tap to set the line.');
     } catch (e) {
       setStatus('Camera error: ' + e);
       startBtn.disabled = false;
     }
   };
   maskBtn.onclick = () => { showMask = !showMask; };
+  pickBtn.onclick = () => { pickMode = !pickMode; pickBtn.classList.toggle('toggled', pickMode); setStatus(pickMode?'Tap the ball to sample color':''); };
+  resetBtn.onclick = () => {
+    LOWER = [5,120,200]; UPPER = [25,255,255];
+    localStorage.removeItem('pong_lower'); localStorage.removeItem('pong_upper');
+    refreshHSVTag(); setStatus('HSV reset to defaults.');
+  };
 
   // Ensure mats & canvases match the current video size
   function ensureSize() {
@@ -143,9 +161,9 @@
     canvas.height = overlay.height = H;
     grab.width = W; grab.height = H;
 
-    src    = new cv.Mat(H, W, cv.CV_8UC4);
-    frame  = new cv.Mat(H, W, cv.CV_8UC3);
-    hsv    = new cv.Mat();
+    src    = new cv.Mat(H, W, cv.CV_8UC4);  // RGBA
+    frame  = new cv.Mat(H, W, cv.CV_8UC3);  // BGR
+    hsv    = new cv.Mat();                   // HSV
     mask   = new cv.Mat();
     blur   = new cv.Mat();
     opened = new cv.Mat();
@@ -162,7 +180,6 @@
   function maybeStart(){
     if (!opencvReady || !streamReady) return;
     if (!ensureSize()) return;
-    setStatus('Running… tap = set line, long-press = pick color');
     loop();
   }
 
@@ -170,17 +187,23 @@
     const circle = cv.minEnclosingCircle(c);
     const x = circle.center.x, y = circle.center.y, r = circle.radius;
     if (r < 6 || r > 90) return [false, x, y, r];
-    const area = cv.contourArea(c, false); if (area <= 1) return [false, x, y, r];
-    const peri = cv.arcLength(c, true);    if (peri <= 1) return [false, x, y, r];
+
+    const area = cv.contourArea(c, false);
+    if (area <= 1) return [false, x, y, r];
+    const peri = cv.arcLength(c, true);
+    if (peri <= 1) return [false, x, y, r];
 
     const circularity = 4.0 * Math.PI * (area / (peri * peri));
     if (circularity < 0.70) return [false, x, y, r];
 
-    const hull = new cv.Mat(); cv.convexHull(c, hull, false, true);
-    const hullArea = cv.contourArea(hull, false); hull.delete();
+    const hull = new cv.Mat();
+    cv.convexHull(c, hull, false, true);
+    const hullArea = cv.contourArea(hull, false);
+    hull.delete();
     if (hullArea <= 0) return [false, x, y, r];
     const solidity = area / hullArea;
     if (solidity < 0.85) return [false, x, y, r];
+
     return [true, x, y, r];
   }
 
@@ -189,40 +212,14 @@
       try {
         if (!ensureSize()) { requestAnimationFrame(tick); return; }
 
-        // Grab current frame
+        // Grab current frame (RGBA)
         gtx.drawImage(video, 0, 0, W, H);
         const imgData = gtx.getImageData(0, 0, W, H);
-        src.data.set(imgData.data);  // RGBA
+        src.data.set(imgData.data);
 
-        // Process
+        // Convert for processing (BGR -> HSV), but display the original RGBA (src) to keep colors normal
         cv.cvtColor(src, frame, cv.COLOR_RGBA2BGR);
         cv.cvtColor(frame, hsv, cv.COLOR_BGR2HSV);
-
-        // If user long-pressed, sample a small patch and set HSV
-        if (pendingPick){
-          const {x, y} = pendingPick;
-          const r = 6; // sample radius
-          const Hs=[], Ss=[], Vs=[];
-          for (let dy=-r; dy<=r; dy++){
-            const yy = clamp(y+dy, 0, H-1);
-            for (let dx=-r; dx<=r; dx++){
-              const xx = clamp(x+dx, 0, W-1);
-              const idx = (yy*W + xx)*3;
-              Hs.push(hsv.data[idx]);
-              Ss.push(hsv.data[idx+1]);
-              Vs.push(hsv.data[idx+2]);
-            }
-          }
-          const h0 = median(Hs), s0 = median(Ss), v0 = median(Vs);
-          const huePad = 12, svPad = 60;
-          LOWER = [ clamp(h0 - huePad, 0, 179), clamp(s0 - svPad, 0, 255), clamp(v0 - svPad, 0, 255) ];
-          UPPER = [ clamp(h0 + huePad, 0, 179), 255, 255 ];
-          localStorage.setItem('pong_lower', JSON.stringify(LOWER));
-          localStorage.setItem('pong_upper', JSON.stringify(UPPER));
-          refreshHSVTag();
-          setStatus(`HSV updated → H[${LOWER[0]}-${UPPER[0]}] S[${LOWER[1]}-255] V[${LOWER[2]}-255]`);
-          pendingPick = null;
-        }
 
         // Threshold & cleanup
         const lower = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), [LOWER[0], LOWER[1], LOWER[2], 0]);
@@ -257,8 +254,8 @@
         else            validDetectStreak = 0;
         if (validDetectStreak < 2) ballCenter = null;
 
-        // Draw frame or mask
-        cv.imshow('canvas', showMask ? opened : frame);
+        // Draw: original video (src) or mask
+        cv.imshow('canvas', showMask ? opened : src);
 
         // Overlay
         ctxUI.clearRect(0,0,overlay.width,overlay.height);
